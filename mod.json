@@ -1,0 +1,35 @@
+{
+	"geode": "5.10.1",
+	"gd": {
+		"win": "2.2081"
+	},
+	"id": "tgskoz.easyprint",
+	"name": "EasyPrint",
+	"version": "v0.1.0",
+	"developer": "tgskoZ",
+	"description": "Press Print Screen to copy a screenshot of the game to your clipboard - no crashes, no hassle.",
+	"tags": ["utility", "offline", "enhancement"],
+	"links": {
+		"source": "https://github.com/tgskoZ/EasyPrint"
+	},
+	"settings": {
+		"block-system-screenshot": {
+			"type": "bool",
+			"name": "Block Windows Print Screen",
+			"description": "While Geometry Dash is the active window, stop Windows from handling Print Screen itself (Snipping Tool popping up, the game minimizing or freezing). EasyPrint takes the screenshot instead.",
+			"default": true
+		},
+		"show-notification": {
+			"type": "bool",
+			"name": "Show Notification",
+			"description": "Show a small notification after the screenshot has been copied.",
+			"default": true
+		},
+		"save-to-file": {
+			"type": "bool",
+			"name": "Also Save To File",
+			"description": "Besides copying to the clipboard, also save every screenshot as a .bmp file in the mod's save folder (<cy>screenshots</c>).",
+			"default": false
+		}
+	}
+}

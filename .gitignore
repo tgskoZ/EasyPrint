@@ -1,0 +1,7 @@
+build/
+build-*/
+out/
+.cache/
+.vs/
+.vscode/
+*.geode
