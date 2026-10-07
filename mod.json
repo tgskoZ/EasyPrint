@@ -5,7 +5,7 @@
 	},
 	"id": "tgskoz.easyprint",
 	"name": "EasyPrint",
-	"version": "v0.1.0",
+	"version": "v0.1.1",
 	"developer": "tgskoZ",
 	"description": "Press Print Screen to copy a screenshot of the game to your clipboard - no crashes, no hassle.",
 	"tags": ["utility", "offline", "enhancement"],

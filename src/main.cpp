@@ -20,10 +20,10 @@ using namespace geode::prelude;
 #endif
 
 namespace {
-    // Set when Print Screen is pressed; consumed by the next swapBuffers call,
-    // right before the finished frame is presented.
+    // Set when a screenshot should be taken; consumed by the next swapBuffers
+    // call, right before the finished frame is presented.
     std::atomic_bool s_captureRequested = false;
-    // True while a previous screenshot is still being copied / saved.
+    // True while a previous screenshot is still being saved.
     std::atomic_bool s_busy = false;
     // True once the low-level keyboard hook is up. If it fails to install,
     // the in-game key listener triggers screenshots instead.
@@ -31,15 +31,53 @@ namespace {
     std::atomic_bool s_blockSystem = true;
     std::atomic_bool s_printDown = false;
 
-    void requestCapture() {
-        if (s_busy) return;
-        s_captureRequested = true;
+    // A 24-bit bottom-up DIB: BITMAPINFOHEADER followed by the pixels.
+    struct Screenshot {
+        std::vector<uint8_t> dib;
+        int width = 0;
+        int height = 0;
+    };
+
+    void captureWithRenderTexture();
+
+    HWND getGameWindow() {
+        if (HWND window = WindowFromDC(wglGetCurrentDC())) {
+            return window;
+        }
+        DWORD pid = 0;
+        HWND foreground = GetForegroundWindow();
+        GetWindowThreadProcessId(foreground, &pid);
+        return pid == GetCurrentProcessId() ? foreground : nullptr;
     }
 
     bool isGameFocused() {
         DWORD pid = 0;
         GetWindowThreadProcessId(GetForegroundWindow(), &pid);
         return pid == GetCurrentProcessId();
+    }
+
+    // Must be called on the main thread.
+    void startCapture() {
+        if (s_busy || s_captureRequested) return;
+        log::info("Print Screen pressed, taking screenshot");
+        s_captureRequested = true;
+
+        // Normally the swapBuffers hook grabs the frame this very frame. If it
+        // didn't (hook not called for some reason), render the scene ourselves
+        // on the next frame instead.
+        Loader::get()->queueInMainThread([] {
+            Loader::get()->queueInMainThread([] {
+                if (s_captureRequested.exchange(false)) {
+                    log::warn("swapBuffers capture didn't happen, using render texture fallback");
+                    captureWithRenderTexture();
+                }
+            });
+        });
+    }
+
+    // Safe to call from any thread.
+    void requestCapture() {
+        Loader::get()->queueInMainThread(&startCapture);
     }
 
     // Windows itself reacts to Print Screen (Snipping Tool, screen capture
@@ -85,17 +123,54 @@ namespace {
         }).detach();
     }
 
-    bool copyToClipboard(std::vector<uint8_t> const& dib) {
-        if (!OpenClipboard(nullptr)) return false;
+    Screenshot makeScreenshot(int width, int height) {
+        // 24-bit DIB rows are padded to 4 bytes.
+        size_t stride = (static_cast<size_t>(width) * 3 + 3) & ~size_t(3);
+        size_t imageSize = stride * height;
+
+        Screenshot shot;
+        shot.width = width;
+        shot.height = height;
+        shot.dib.resize(sizeof(BITMAPINFOHEADER) + imageSize);
+
+        auto* info = reinterpret_cast<BITMAPINFOHEADER*>(shot.dib.data());
+        info->biSize = sizeof(BITMAPINFOHEADER);
+        info->biWidth = width;
+        info->biHeight = height;
+        info->biPlanes = 1;
+        info->biBitCount = 24;
+        info->biCompression = BI_RGB;
+        info->biSizeImage = static_cast<DWORD>(imageSize);
+        return shot;
+    }
+
+    uint8_t* pixels(Screenshot& shot) {
+        return shot.dib.data() + sizeof(BITMAPINFOHEADER);
+    }
+
+    bool copyToClipboard(Screenshot const& shot) {
+        // The clipboard needs an owner window: with a null owner,
+        // EmptyClipboard makes the following SetClipboardData fail.
+        HWND owner = getGameWindow();
+        bool opened = false;
+        for (int i = 0; i < 5 && !(opened = OpenClipboard(owner)); i++) {
+            // Another app may be holding the clipboard for a moment.
+            Sleep(10);
+        }
+        if (!opened) {
+            log::error("OpenClipboard failed (error {})", GetLastError());
+            return false;
+        }
         EmptyClipboard();
 
         bool ok = false;
-        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, dib.size())) {
+        if (HGLOBAL mem = GlobalAlloc(GMEM_MOVEABLE, shot.dib.size())) {
             if (void* dst = GlobalLock(mem)) {
-                std::memcpy(dst, dib.data(), dib.size());
+                std::memcpy(dst, shot.dib.data(), shot.dib.size());
                 GlobalUnlock(mem);
                 // On success the clipboard owns the memory.
                 ok = SetClipboardData(CF_DIB, mem) != nullptr;
+                if (!ok) log::error("SetClipboardData failed (error {})", GetLastError());
             }
             if (!ok) GlobalFree(mem);
         }
@@ -104,7 +179,7 @@ namespace {
         return ok;
     }
 
-    Result<std::filesystem::path> saveToFile(std::vector<uint8_t> const& dib) {
+    Result<std::filesystem::path> saveToFile(Screenshot const& shot) {
         auto dir = Mod::get()->getSaveDir() / "screenshots";
         std::error_code ec;
         std::filesystem::create_directories(dir, ec);
@@ -124,105 +199,152 @@ namespace {
 
         BITMAPFILEHEADER header{};
         header.bfType = 0x4D42; // "BM"
-        header.bfSize = static_cast<DWORD>(sizeof(header) + dib.size());
+        header.bfSize = static_cast<DWORD>(sizeof(header) + shot.dib.size());
         header.bfOffBits = sizeof(BITMAPFILEHEADER) + sizeof(BITMAPINFOHEADER);
 
         std::ofstream file(path, std::ios::binary);
         if (!file) return Err("Unable to open file");
         file.write(reinterpret_cast<char const*>(&header), sizeof(header));
-        file.write(reinterpret_cast<char const*>(dib.data()), dib.size());
+        file.write(reinterpret_cast<char const*>(shot.dib.data()), shot.dib.size());
         if (!file) return Err("Unable to write file");
         return Ok(path);
     }
 
-    void notify(std::string text, NotificationIcon icon) {
-        Loader::get()->queueInMainThread([text = std::move(text), icon] {
-            if (icon == NotificationIcon::Success && !Mod::get()->getSettingValue<bool>("show-notification")) {
-                return;
-            }
-            Notification::create(text, icon)->show();
-        });
+    void notify(std::string const& text, NotificationIcon icon) {
+        if (icon == NotificationIcon::Success && !Mod::get()->getSettingValue<bool>("show-notification")) {
+            return;
+        }
+        Notification::create(text, icon)->show();
     }
 
-    // Reads the frame that is about to be presented and hands it off to a
-    // worker thread, so the game doesn't stutter while copying / saving.
+    // Main thread: copy to the clipboard right away (it's just a memcpy),
+    // then save the file on a worker thread if enabled.
+    void deliver(Screenshot shot) {
+        bool copied = copyToClipboard(shot);
+        log::info("Screenshot {}x{} {}", shot.width, shot.height, copied ? "copied to clipboard" : "NOT copied");
+
+        if (!Mod::get()->getSettingValue<bool>("save-to-file")) {
+            if (copied) {
+                notify(fmt::format("Screenshot copied! ({}x{})", shot.width, shot.height), NotificationIcon::Success);
+            } else {
+                notify("EasyPrint: failed to copy screenshot", NotificationIcon::Error);
+            }
+            return;
+        }
+
+        s_busy = true;
+        std::thread([shot = std::move(shot), copied] {
+            auto res = saveToFile(shot);
+            if (res.isOk()) {
+                log::info("Saved screenshot to {}", utils::string::pathToString(res.unwrap()));
+            } else {
+                log::error("Failed to save screenshot: {}", res.unwrapErr());
+            }
+            bool saved = res.isOk();
+            int width = shot.width, height = shot.height;
+
+            Loader::get()->queueInMainThread([copied, saved, width, height] {
+                if (copied) {
+                    notify(
+                        fmt::format("Screenshot copied! ({}x{}){}", width, height, saved ? "\nSaved to file" : ""),
+                        NotificationIcon::Success
+                    );
+                } else if (saved) {
+                    notify("Couldn't copy to clipboard, saved to file", NotificationIcon::Warning);
+                } else {
+                    notify("EasyPrint: failed to copy screenshot", NotificationIcon::Error);
+                }
+                s_busy = false;
+            });
+        }).detach();
+    }
+
+    // Reads the frame that is about to be presented, at the window's size.
     void captureBackBuffer() {
-        HWND window = WindowFromDC(wglGetCurrentDC());
+        HWND window = getGameWindow();
         RECT rect{};
         if (!window || !GetClientRect(window, &rect)) {
-            notify("EasyPrint: couldn't find the game window", NotificationIcon::Error);
+            log::warn("Couldn't get game window, using render texture fallback");
+            captureWithRenderTexture();
             return;
         }
         int width = rect.right - rect.left;
         int height = rect.bottom - rect.top;
         if (width <= 0 || height <= 0) return;
 
-        // 24-bit DIB rows are padded to 4 bytes, which is exactly what
-        // glReadPixels produces with GL_PACK_ALIGNMENT = 4. OpenGL also
-        // returns rows bottom-up, same as a DIB, so no conversion is needed.
-        size_t stride = (static_cast<size_t>(width) * 3 + 3) & ~size_t(3);
-        size_t imageSize = stride * height;
-
-        std::vector<uint8_t> dib(sizeof(BITMAPINFOHEADER) + imageSize);
-        auto* info = reinterpret_cast<BITMAPINFOHEADER*>(dib.data());
-        info->biSize = sizeof(BITMAPINFOHEADER);
-        info->biWidth = width;
-        info->biHeight = height;
-        info->biPlanes = 1;
-        info->biBitCount = 24;
-        info->biCompression = BI_RGB;
-        info->biSizeImage = static_cast<DWORD>(imageSize);
+        auto shot = makeScreenshot(width, height);
 
         GLint prevFramebuffer = 0;
         GLint prevAlignment = 4;
         glGetIntegerv(GL_FRAMEBUFFER_BINDING, &prevFramebuffer);
         glGetIntegerv(GL_PACK_ALIGNMENT, &prevAlignment);
+        while (glGetError() != GL_NO_ERROR) {}
 
+        // With GL_PACK_ALIGNMENT = 4 the rows come out padded exactly like a
+        // DIB, and OpenGL returns them bottom-up just like a DIB too.
         glBindFramebuffer(GL_FRAMEBUFFER, 0);
         glReadBuffer(GL_BACK);
         glPixelStorei(GL_PACK_ALIGNMENT, 4);
-        glReadPixels(0, 0, width, height, GL_BGR, GL_UNSIGNED_BYTE, dib.data() + sizeof(BITMAPINFOHEADER));
+        glReadPixels(0, 0, width, height, GL_BGR, GL_UNSIGNED_BYTE, pixels(shot));
         GLenum error = glGetError();
 
         glPixelStorei(GL_PACK_ALIGNMENT, prevAlignment);
         glBindFramebuffer(GL_FRAMEBUFFER, prevFramebuffer);
 
         if (error != GL_NO_ERROR) {
-            log::error("glReadPixels failed: {}", error);
+            log::warn("glReadPixels failed ({}), using render texture fallback", error);
+            captureWithRenderTexture();
+            return;
+        }
+        deliver(std::move(shot));
+    }
+
+    // Fallback: render the current scene into an offscreen texture.
+    void captureWithRenderTexture() {
+        auto director = CCDirector::get();
+        auto scene = director->getRunningScene();
+        if (!scene) {
             notify("EasyPrint: failed to capture the screen", NotificationIcon::Error);
             return;
         }
 
-        bool saveFile = Mod::get()->getSettingValue<bool>("save-to-file");
-        s_busy = true;
-        std::thread([dib = std::move(dib), saveFile, width, height] {
-            bool copied = copyToClipboard(dib);
-            if (!copied) {
-                log::error("Failed to copy screenshot to clipboard (error {})", GetLastError());
-            }
+        auto size = director->getWinSize();
+        auto rt = CCRenderTexture::create(
+            static_cast<int>(size.width), static_cast<int>(size.height), kCCTexture2DPixelFormat_RGBA8888
+        );
+        if (!rt) {
+            notify("EasyPrint: failed to capture the screen", NotificationIcon::Error);
+            return;
+        }
+        rt->begin();
+        scene->visit();
+        rt->end();
 
-            bool saved = false;
-            if (saveFile) {
-                if (auto res = saveToFile(dib); res.isOk()) {
-                    saved = true;
-                    log::info("Saved screenshot to {}", utils::string::pathToString(res.unwrap()));
-                } else {
-                    log::error("Failed to save screenshot: {}", res.unwrapErr());
-                }
-            }
+        // Not flipped: rows stay bottom-up, as a DIB wants them.
+        auto image = rt->newCCImage(false);
+        if (!image) {
+            notify("EasyPrint: failed to capture the screen", NotificationIcon::Error);
+            return;
+        }
 
-            if (copied) {
-                notify(
-                    fmt::format("Screenshot copied! ({}x{}){}", width, height, saved ? "\nSaved to file" : ""),
-                    NotificationIcon::Success
-                );
-            } else if (saved) {
-                notify("Couldn't copy to clipboard, saved to file", NotificationIcon::Warning);
-            } else {
-                notify("EasyPrint: failed to copy screenshot", NotificationIcon::Error);
+        int width = image->getWidth();
+        int height = image->getHeight();
+        auto shot = makeScreenshot(width, height);
+        size_t stride = (static_cast<size_t>(width) * 3 + 3) & ~size_t(3);
+        uint8_t const* src = image->getData();
+        uint8_t* dst = pixels(shot);
+        for (int y = 0; y < height; y++) {
+            uint8_t const* in = src + static_cast<size_t>(y) * width * 4;
+            uint8_t* out = dst + static_cast<size_t>(y) * stride;
+            for (int x = 0; x < width; x++) {
+                out[x * 3 + 0] = in[x * 4 + 2];
+                out[x * 3 + 1] = in[x * 4 + 1];
+                out[x * 3 + 2] = in[x * 4 + 0];
             }
-            s_busy = false;
-        }).detach();
+        }
+        image->release();
+
+        deliver(std::move(shot));
     }
 }
 
