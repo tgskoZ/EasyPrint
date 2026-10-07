@@ -1,3 +1,10 @@
+# v0.2.0
+- Print Screen now lets you select an area, like the Windows snipping tool, but inside the game: the frame freezes, you drag a rectangle and it is copied to the clipboard.
+- Enter or Space copies the whole screen, Esc or right click cancels.
+- The level is paused while you select, so you don't die.
+- New setting "Select Area" (turn off to copy the whole screen instantly).
+- Print Screen is now detected on key release, which works on more keyboards.
+
 # v0.1.1
 - Fixed screenshots not being copied to the clipboard.
 - Added a fallback capture method in case the main one doesn't work.

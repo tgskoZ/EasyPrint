@@ -5,14 +5,20 @@
 	},
 	"id": "tgskoz.easyprint",
 	"name": "EasyPrint",
-	"version": "v0.1.1",
+	"version": "v0.2.0",
 	"developer": "tgskoZ",
-	"description": "Press Print Screen to copy a screenshot of the game to your clipboard - no crashes, no hassle.",
+	"description": "Press Print Screen, select an area and it is copied to your clipboard - no crashes, no hassle.",
 	"tags": ["utility", "offline", "enhancement"],
 	"links": {
 		"source": "https://github.com/tgskoZ/EasyPrint"
 	},
 	"settings": {
+		"select-area": {
+			"type": "bool",
+			"name": "Select Area",
+			"description": "After pressing Print Screen, the game freezes and you drag out the area to copy (Enter copies the whole screen, Esc or right click cancels). Turn off to always copy the whole screen instantly.",
+			"default": true
+		},
 		"block-system-screenshot": {
 			"type": "bool",
 			"name": "Block Windows Print Screen",
